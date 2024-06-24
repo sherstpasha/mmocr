@@ -1,0 +1,1 @@
+docker run --gpus all -it -p 7860:7860 --name mmocr-container mmocr-image python /mmocr/app.py
