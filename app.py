@@ -189,63 +189,91 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
-def slide_window_detection(image_path, inferencer, tile_size=512, overlap=50):
+def slide_window_detection(image_path, inferencer, tile_size=512, overlap=4):
     image = cv2.imread(image_path)
     height, width, _ = image.shape
     step = tile_size - overlap
     detections = []
 
+    print(f"Начало slide window detection: height={height}, width={width}, tile_size={tile_size}, overlap={overlap}, step={step}")
+
     for y in range(0, height, step):
         for x in range(0, width, step):
-            tile = image[y : y + tile_size, x : x + tile_size]
+            print(f"Обработка тайла: x={x}, y={y}")
+            tile = image[y:y + tile_size, x:x + tile_size]
             if tile.shape[0] < tile_size or tile.shape[1] < tile_size:
-                tile = cv2.copyMakeBorder(
-                    tile,
-                    0,
-                    tile_size - tile.shape[0],
-                    0,
-                    tile_size - tile.shape[1],
-                    cv2.BORDER_CONSTANT,
-                    value=[0, 0, 0],
-                )
-
+                tile = cv2.copyMakeBorder(tile, 0, tile_size - tile.shape[0], 0, tile_size - tile.shape[1], cv2.BORDER_CONSTANT, value=[0, 0, 0])
+            
             tile_path = f"tile_{y}_{x}.jpg"
             cv2.imwrite(tile_path, tile)
 
             tile_result = inferencer(tile_path)
-            if "predictions" in tile_result:
-                tile_detections = tile_result["predictions"][0]["det_polygons"]
-                for det in tile_detections:
-                    box = det
-                    for i in range(len(box)):
-                        box[i][0] += x
-                        box[i][1] += y
-                    detections.append({"coordinates": box, "score": det["score"]})
+            print(f"Результат инференса для тайла: {tile_result}")
+            if 'predictions' in tile_result and tile_result['predictions']:
+                tile_detections = tile_result['predictions'][0]['det_polygons']
+                tile_scores = tile_result['predictions'][0]['det_scores']
+                for polygon, score in zip(tile_detections, tile_scores):
+                    if isinstance(polygon, list):
+                        if all(isinstance(coord, float) for coord in polygon):
+                            polygon = [(polygon[i], polygon[i + 1]) for i in range(0, len(polygon), 2)]
+                        elif all(isinstance(coord, list) for coord in polygon):
+                            polygon = [tuple(point) for point in polygon]
+                        polygon = [(point[0] + x, point[1] + y) for point in polygon]
+                        detections.append({"coordinates": polygon, "score": score})
 
-    # Применение NMS для объединения детекций
+    print(f"Всего детекций до NMS: {len(detections)}")
+    if len(detections) == 0:
+        return []
+
     final_detections = non_max_suppression(detections, iou_threshold=0.5)
+    print(f"Всего детекций после NMS: {len(final_detections)}")
     return final_detections
 
 
+
+def convert_polygons_to_bboxes(polygons):
+    bboxes = []
+    for polygon in polygons:
+        x_coords = [point[0] for point in polygon]
+        y_coords = [point[1] for point in polygon]
+        x_min = min(x_coords)
+        y_min = min(y_coords)
+        width = max(x_coords) - x_min
+        height = max(y_coords) - y_min
+        bboxes.append([x_min, y_min, width, height])
+    return bboxes
+
 def non_max_suppression(detections, iou_threshold):
-    boxes = np.array([det["coordinates"] for det in detections])
-    scores = np.array([det["score"] for det in detections])
+    try:
+        # Extracting coordinates and scores
+        boxes = np.array([det['coordinates'] for det in detections])
+        scores = np.array([det['score'] for det in detections])
 
-    # Преобразуем координаты боксов в формат (x1, y1, x2, y2)
-    x1 = boxes[:, :, 0].min(axis=1)
-    y1 = boxes[:, :, 1].min(axis=1)
-    x2 = boxes[:, :, 0].max(axis=1)
-    y2 = boxes[:, :, 1].max(axis=1)
-    boxes = np.stack([x1, y1, x2, y2], axis=1)
+        print(f"boxes: {boxes}")
+        print(f"scores: {scores}")
 
-    indices = cv2.dnn.NMSBoxes(
-        boxes.tolist(),
-        scores.tolist(),
-        score_threshold=0.5,
-        nms_threshold=iou_threshold,
-    )
-    return [detections[i[0]] for i in indices]
+        # Converting polygons to bounding boxes
+        if len(boxes) > 0 and isinstance(boxes[0][0], tuple):
+            boxes = convert_polygons_to_bboxes(boxes)
 
+        print(f"Formatted boxes for NMS: {boxes}")
+
+        # Check the format of boxes
+        if not all(len(box) == 4 for box in boxes):
+            raise ValueError("Bounding boxes are not in the correct [x, y, width, height] format")
+
+        # Applying NMS
+        indices = cv2.dnn.NMSBoxes(boxes, scores.tolist(), score_threshold=0.5, nms_threshold=iou_threshold)
+
+        print(f"indices: {indices}")
+
+        # Returning filtered detections
+        final_detections = [detections[i[0]] for i in indices]
+
+        return final_detections
+    except Exception as e:
+        print(f"Ошибка в non_max_suppression: {e}")
+        return []
 
 def enhance_contrast(image_path, output_path="enhanced_image.jpg"):
     try:
@@ -273,7 +301,8 @@ def process_image(image_path, inferencer):
             det_polygons = det_result["det_polygons"]
             det_scores = det_result["det_scores"]
             for polygon, score in zip(det_polygons, det_scores):
-                formatted_result.append({"coordinates": polygon, "score": score})
+                if isinstance(polygon, list) and isinstance(score, (float, int)):
+                    formatted_result.append({"coordinates": polygon, "score": score})
 
         print("Обработка изображения завершена")
         return formatted_result
@@ -290,8 +319,8 @@ def draw_boxes(image_path, detections):
 
         for detection in detections:
             coords = detection["coordinates"]
-            if isinstance(coords[0], list) or isinstance(coords[0], tuple):
-                polygon = [tuple(point) for point in coords]
+            if isinstance(coords[0], tuple):
+                polygon = coords
             else:
                 polygon = [(coords[i], coords[i + 1]) for i in range(0, len(coords), 2)]
             score = detection["score"]
